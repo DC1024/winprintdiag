@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rules:
+    name: 规则回归测试 / rule regression tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 提取并运行 19 例规则测试
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File ./tests/token_rules_test.ps1
+          if ($LASTEXITCODE -ne 0) { throw "token_rules_test.ps1 失败 (exit $LASTEXITCODE)" }
+          Get-Content ./tests/token_rules_test_result.txt
+
+      - name: 上传测试输出
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: token-rules-result
+          path: tests/token_rules_test_result.txt
+          if-no-files-found: warn
+
+  html:
+    name: 宣传页结构校验 / landing page lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: 校验 docs/index.html
+        run: |
+          python tests/htmlcheck.py
+          cat tests/htmlcheck_result.txt

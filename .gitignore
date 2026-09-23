@@ -1,0 +1,17 @@
+# 运行时生成物（报告 / 自检日志 / 备份与隔离目录）
+reports/
+quarantine_*/
+PRINTERS_backup_*/
+ui_selftest.txt
+ui_selftest_deep.txt
+tests/token_rules_test_result.txt
+tests/htmlcheck_result.txt
+tests/_functions_extracted.ps1
+
+# 工具在自身目录生成的报告（形如 WinPrintDiag_20260923_123128.txt）
+WinPrintDiag_2*.txt
+
+# 系统垃圾
+Thumbs.db
+desktop.ini
+*.log
