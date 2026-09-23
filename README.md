@@ -37,6 +37,8 @@ WinPrintDiag 把散落在**事件日志、注册表、队列目录**里的线索
 | **组件存储比对** | 签名异常时列出 `WinSxS` 里的正版候选文件，供还原使用 |
 | **打印机配对** | 每台打印机的 **连接方式**（USB 直连 / 网络 WSD / 网络 IPP / 网络 IP / 虚拟）、端口、驱动；检测端口与驱动错配 |
 | **重复条目** | 检测**同一台物理打印机被注册成多个条目** —— 最常见的原因就是 USB 和无线同时连着。`USB + 网络` 组合判定为高危 |
+| **该留哪条（使用证据）** | 光说「有重复」还不够，人最想知道的是**删哪一条**。工具会去读打印操作日志（`PrintService/Operational` 事件 307）的**结构化字段**（打印机名 / 端口名），算出每条条目**最近用过的时间和使用次数**，直接给出「建议保留 X / 建议删除 Y」和判定依据 |
+| **孤儿端口标注** | `USB001` 这类端口定义即使没有任何打印机指向它，也会一直留在注册表里。报告会逐条注明**是否有打印机在用**，避免把残留端口误读成「USB 通道还活着」 |
 | **打印队列** | 队列文件数、合计体积、最新 / 最早任务时间；解码 `.SHD` 描述文件里的任务内容 |
 | **变更相关性** | 近 45 天补丁与软件安装、近 30 天意外关机、近 7 天开机次数、蓝屏转储数量 |
 | **审计日志** | 打印操作日志（`PrintService/Operational`）是否开启 |
@@ -82,11 +84,20 @@ usbmon.dll        1351680   10.0.26100.8875    2026-09-22 00:11  有效
 Adobe PDF                               Documents\*.pdf              虚拟/本地   Adobe PDF Converter
 Pantum M6200NW Series 0001              IPP_Pantum-13CEDD_1          网络 IPP    Pantum M6200NW Series
 Pantum-13CEDD (M6200NW series)          WSD-c0c4001a-e93a-4cd5-8f4f~ 网络 WSD    Microsoft IPP Class Driver
+-- USB 监视器端口 --
+  USB001  （无打印机使用；只是残留的端口定义，拔插线缆不会改变它，也不影响打印）
 
 ===== [10] 结论与建议 =====
 发现以下问题:
   [警告] 同一台打印机注册了多个条目: Pantum M6200NW Series 0001 [网络 IPP] 与
          Pantum-13CEDD (M6200NW series) [网络 WSD]  (共有标识: m6200nw/13cedd)
+       使用记录（打印操作日志事件 307）:
+         Pantum M6200NW Series 0001     最近 2026-09-23 15:23:12，共 32 次
+         Pantum-13CEDD (M6200NW series) 无使用记录
+       建议保留: 「Pantum M6200NW Series 0001」
+       建议删除: 「Pantum-13CEDD (M6200NW series)」
+       依据: 有成功打印记录，而另一条从未被使用过
+       操作: 设置 → 蓝牙和其他设备 → 打印机和扫描仪 → 选中「…」→ 删除设备
 ```
 
 发现项按 `[严重]` / `[警告]` / `[提示]` 三档分级，图形界面顶部结论条会按最严重的一档变色。
@@ -104,13 +115,38 @@ Pantum-13CEDD (M6200NW series)          WSD-c0c4001a-e93a-4cd5-8f4f~ 网络 WSD 
 
 图形界面里对应「修复（需管理员）」和「清理队列」两个按钮，会自动请求提权。
 
+### 「该删哪一条」是怎么判的
+
+发现重复条目只是第一步，真正难的是取舍。工具按下面的优先级给结论：
+
+1. **只有一条有成功打印记录** → 留它，删另一条（最常见也最可靠的情况）
+2. **两条都有记录** → 按「最近用过」排序给建议，同时**明确提示需人工确认**，因为两条都可能真的在用
+3. **两条都没有记录** → 退化为按驱动判断，**留装了厂商驱动的那条**（通用 IPP/Mopria 类驱动会缺厂商功能，如墨量、双面、纸盒）
+4. **都没有记录、驱动也同类** → **不下结论**，只说明无法判断，而不是猜一个
+
+使用证据来自 `Microsoft-Windows-PrintService/Operational` 事件 307（文档打印成功）。这里刻意**不解析本地化的 `.Message` 文案**，而是按固定位置读 `DocumentPrinted/Param5`（打印机名）与 `Param6`（端口名）—— 文案随系统语言变，字段位置不变。查询时**先按端口匹配**（这样即便打印机被改过名也能认出来），再退回按名字匹配。
+
+日志被关掉或读不到时，工具**不会假装有证据**，会直说「无法判断」并告诉你怎么把日志打开。
+
+> **注意：重复条目是系统里的登记项，不是线缆状态。** 拔掉 USB 线缆不会让告警消失 —— 必须到「设置 → 蓝牙和其他设备 → 打印机和扫描仪」把多余那条**删掉**。如果两条都是网络通道（比如 IPP + WSD），那这事儿跟 USB 一点关系都没有。
+
+### 自己重新打包 exe
+
+仓库里提交的 `WinPrintDiag.exe` / `WinPrintDiagUI.exe` 是**把脚本嵌进去**的单文件产物。改了 `.ps1` 之后必须重打包，否则 exe 里跑的仍是旧逻辑：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build-exe.ps1
+```
+
+脚本会自动下载 PS2EXE（`Find-Module` 在非交互环境下会卡住，所以直接下 nupkg），分别以 Console / GUI 两种模式编译，最后读 PE 头的子系统号**离线校验**打的是哪种模式。
+
 ### 设计取舍：宁可漏报，不可误报
 
 判定「同一台打印机是否注册了多个条目」时，工具从**打印机名 + 端口名**提词，只认**长度 ≥ 5 且同时含字母和数字**的共有词（如 `13cedd`、`m6200nw`、`l2350dw`）。
 
 这样 `pdf`、`series`、`0001` 这类通用词或纯数字，不会把 Adobe PDF、PDF-XChange、PDF24、导出为 WPS PDF 这些虚拟打印机凑成一对。
 
-代价是 `HP LaserJet 1020 (Copy 1)` 与 `(Copy 2)` 这类同型号重复副本会漏报 —— 这是**刻意的**：诊断工具误报比漏报更伤信任。规则有 19 条回归测试兜底。
+代价是 `HP LaserJet 1020 (Copy 1)` 与 `(Copy 2)` 这类同型号重复副本会漏报 —— 这是**刻意的**：诊断工具误报比漏报更伤信任。规则有 39 条回归测试兜底。
 
 ### 自测
 
@@ -118,7 +154,7 @@ Pantum-13CEDD (M6200NW series)          WSD-c0c4001a-e93a-4cd5-8f4f~ 网络 WSD 
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\token_rules_test.ps1
 ```
 
-19 条用例，覆盖连接方式识别、应告警场景（USB + 网络双条目）、以及 6 种不应误报的场景。测试直接从主脚本里**抽取函数原文**来跑，所以不会出现「改了主脚本、忘了改测试」的情况。
+39 条用例，覆盖连接方式识别、应告警场景（USB + 网络双条目）、6 种不应误报的场景，以及「该留哪条」判定的全部分支（含日志未启用 / 不可读 / 无记录三种降级路径）和多行建议块的缩进对齐。测试直接从主脚本里**抽取函数原文**来跑，所以不会出现「改了主脚本、忘了改测试」的情况。
 
 ### 常见问题
 
@@ -167,6 +203,8 @@ The important part: **it does not depend on the print service.** Printer, port a
 | **Component store diff** | When a signature is invalid, lists the genuine candidates in `WinSxS` for restoration |
 | **Printer pairing** | Per-printer **connection type** (USB / network WSD / network IPP / network IP / virtual), port and driver; detects port-driver mismatches |
 | **Duplicate entries** | Detects the **same physical printer registered as multiple entries** — most often because USB and Wi-Fi are connected at the same time. A `USB + network` combination is flagged critical |
+| **Which one to delete (usage evidence)** | Knowing *that* there are duplicates is only half the answer — people want to know **which entry to delete**. The tool reads the print operation log (`PrintService/Operational`, Event ID 307) and parses its **structured fields** (printer name / port name) to compute **last-used time and use count** per entry, then states “keep X / delete Y” with the reason |
+| **Orphan port annotation** | Port definitions like `USB001` stay in the registry even when no printer points at them. The report annotates each one with **whether any printer is actually using it**, so a leftover port is not mistaken for a live USB channel |
 | **Print queue** | Queue file count, total size, newest / oldest job timestamps; decodes job descriptions from `.SHD` files |
 | **Change correlation** | Updates and software installed in the last 45 days, unexpected shutdowns in 30 days, boot count in 7 days, crash dump count |
 | **Audit log** | Whether the `PrintService/Operational` log is enabled |
@@ -200,13 +238,46 @@ spoolsv 崩溃事件（应用程序日志 1000）: 27
 打印机 / printer       端口 / port                  连接方式 / link   驱动 / driver
 Pantum M6200NW 0001    IPP_Pantum-13CEDD_1          网络 IPP          Pantum M6200NW Series
 Pantum-13CEDD          WSD-c0c4001a-e93a-...        网络 WSD          Microsoft IPP Class Driver
+-- USB 监视器端口 --
+  USB001  （无打印机使用；只是残留的端口定义，拔插线缆不会改变它，也不影响打印）
 
 ===== [10] 结论与建议 / verdict =====
 发现以下问题 / issues found:
   [警告] 同一台打印机注册了多个条目: ...  (共有标识: m6200nw/13cedd)
+       使用记录（打印操作日志事件 307）:
+         Pantum M6200NW Series 0001     最近 2026-09-23 15:23:12，共 32 次
+         Pantum-13CEDD (M6200NW series) 无使用记录
+       建议保留: 「Pantum M6200NW Series 0001」
+       建议删除: 「Pantum-13CEDD (M6200NW series)」
+       依据: 有成功打印记录，而另一条从未被使用过
 ```
 
 Findings are graded `[严重]` critical / `[警告]` warning / `[提示]` info, and the GUI summary bar takes the most severe color.
+
+### How the keep / delete verdict is reached
+
+Spotting a duplicate is only step one; the hard part is the trade-off. The tool uses this priority order:
+
+1. **Only one entry has a successful print record** → keep it, drop the other (the most common and most reliable case)
+2. **Both have records** → recommend by *most recently used*, and **explicitly say a human should confirm**, since both may genuinely be in use
+3. **Neither has records** → fall back to the driver: **keep the vendor-driver one** (generic IPP/Mopria class drivers lack vendor features such as ink level, duplex, tray selection)
+4. **Neither has records and the drivers match** → **give no verdict at all** and say the tool cannot tell, rather than guessing
+
+The evidence comes from `Microsoft-Windows-PrintService/Operational`, Event ID 307 (document printed). It deliberately does **not** parse the localized `.Message` text; it reads `DocumentPrinted/Param5` (printer) and `Param6` (port) by fixed position, because the wording changes with system language while the field positions do not. Lookup is **by port first** (so a renamed printer is still recognized), then falls back to the printer name.
+
+When the log is disabled or unreadable, the tool **does not pretend to have evidence** — it says so and tells you how to turn the log on.
+
+> **Note: duplicate entries are registry registrations, not cable state.** Unplugging the USB cable will not clear the warning — you have to delete the extra entry in *Settings → Bluetooth & devices → Printers & scanners*. If both entries are network channels (IPP + WSD), the issue has nothing to do with USB at all.
+
+### Rebuilding the exes yourself
+
+The committed `WinPrintDiag.exe` / `WinPrintDiagUI.exe` are single-file builds with the **script embedded**. After editing a `.ps1` you must repackage, or the exe keeps running the old logic:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build-exe.ps1
+```
+
+It downloads PS2EXE automatically (`Find-Module` hangs in non-interactive contexts, so the nupkg is fetched directly), compiles once in Console mode and once in GUI mode, then reads the PE header subsystem field to **verify offline** which mode was produced.
 
 ### Optional repair (admin required)
 
@@ -225,7 +296,7 @@ To decide whether two printer records are the same physical device, the tool ext
 
 This keeps generic words and pure numbers (`pdf`, `series`, `0001`) from pairing up unrelated virtual printers such as Adobe PDF, PDF-XChange and PDF24.
 
-The cost: same-model duplicates like `HP LaserJet 1020 (Copy 1)` and `(Copy 2)` are missed. That is deliberate — a diagnostic tool loses credibility faster from false alarms than from misses. The rules are covered by 19 regression tests.
+The cost: same-model duplicates like `HP LaserJet 1020 (Copy 1)` and `(Copy 2)` are missed. That is deliberate — a diagnostic tool loses credibility faster from false alarms than from misses. The rules are covered by 39 regression tests.
 
 ### Tests
 
@@ -233,7 +304,7 @@ The cost: same-model duplicates like `HP LaserJet 1020 (Copy 1)` and `(Copy 2)` 
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\token_rules_test.ps1
 ```
 
-19 cases covering connection-type detection, cases that *must* warn (USB + network duplicates), and 6 cases that must *not* warn. The tests extract the real function bodies from the main script, so they can never drift into testing a stale copy.
+39 cases covering connection-type detection, cases that *must* warn (USB + network duplicates), 6 cases that must *not* warn, and every branch of the keep/delete verdict — including the three degraded paths (log disabled / log unreadable / no records at all) and the indentation alignment of the multi-line advice block. The tests extract the real function bodies from the main script, so they can never drift into testing a stale copy.
 
 ### FAQ
 

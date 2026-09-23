@@ -140,6 +140,225 @@ function Get-PrinterTokens {
     return $res
 }
 
+# 从打印操作日志（Microsoft-Windows-PrintService/Operational，事件 307 = 文档打印成功）
+# 采集「哪个打印机条目真的被用过」。事件字段是固定位置的结构化数据：
+#   Param5 = 打印机名，Param6 = 端口名 —— 不要去解析本地化的 Message 文案，那个随系统语言变。
+# 返回 @{ Total=..; Matched=..; Error=$bool; Disabled=$bool; ByPort=@{}; ByName=@{} }
+function Get-PrinterUsage {
+    param([int]$MaxEvents = 500, [string[]]$KnownPorts = @(), [string[]]$KnownNames = @())
+    $byPort = @{}
+    $byName = @{}
+    $stats = [ordered]@{
+        Total    = 0
+        Matched  = 0
+        Error    = $false
+        Disabled = $false
+        ByPort   = $byPort
+        ByName   = $byName
+    }
+
+    try {
+        $lg = Get-WinEvent -ListLog 'Microsoft-Windows-PrintService/Operational' -ErrorAction Stop
+        if (-not $lg.IsEnabled) {
+            $stats.Disabled = $true
+            return $stats
+        }
+    }
+    catch {
+        $stats.Error = $true
+        return $stats
+    }
+
+    $events = @()
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-PrintService/Operational'; Id = 307 } -MaxEvents $MaxEvents -ErrorAction Stop)
+    }
+    catch {
+        # 日志开着但一条记录都没有时，Get-WinEvent 会抛 NoMatchingEventsFound，这不是错误
+        if ([string]$_.FullyQualifiedErrorId -match 'NoMatchingEventsFound') { return $stats }
+        $stats.Error = $true
+        return $stats
+    }
+
+    $portKeys = @()
+    foreach ($k in $KnownPorts) { $portKeys += ([string]$k).ToLower() }
+    $nameKeys = @()
+    foreach ($k in $KnownNames) { $nameKeys += ([string]$k).ToLower() }
+
+    foreach ($e in $events) {
+        $prn = ''
+        $port = ''
+        try {
+            $x = [xml]$e.ToXml()
+            $node = $x.SelectSingleNode("//*[local-name()='DocumentPrinted']")
+            if ($null -eq $node) { continue }
+            $n5 = $node.SelectSingleNode("*[local-name()='Param5']")
+            $n6 = $node.SelectSingleNode("*[local-name()='Param6']")
+            if ($null -ne $n5) { $prn = [string]$n5.InnerText }
+            if ($null -ne $n6) { $port = [string]$n6.InnerText }
+        }
+        catch {
+            continue
+        }
+        if ([string]::IsNullOrEmpty($port) -and [string]::IsNullOrEmpty($prn)) { continue }
+        $stats.Total = $stats.Total + 1
+        $t = $e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
+        if ($portKeys -contains $port.ToLower()) { $stats.Matched = $stats.Matched + 1 }
+
+        # 注意：值里不能用键名 Count —— Hashtable/OrderedDictionary 自带 Count 属性会覆盖它
+        $pk = $port.ToLower()
+        if (-not [string]::IsNullOrEmpty($pk)) {
+            if ($byPort.ContainsKey($pk)) {
+                $byPort[$pk].Times = $byPort[$pk].Times + 1
+                if ($t -gt $byPort[$pk].Last) { $byPort[$pk].Last = $t }
+            }
+            else {
+                $byPort[$pk] = [ordered]@{ Times = 1; Last = $t; Name = $prn }
+            }
+        }
+        $nk = $prn.ToLower()
+        if (-not [string]::IsNullOrEmpty($nk)) {
+            if ($byName.ContainsKey($nk)) {
+                $byName[$nk].Times = $byName[$nk].Times + 1
+                if ($t -gt $byName[$nk].Last) { $byName[$nk].Last = $t }
+            }
+            else {
+                $byName[$nk] = [ordered]@{ Times = 1; Last = $t; Port = $port }
+            }
+        }
+    }
+    return $stats
+}
+
+# 查某个打印机条目有没有使用记录：先按端口匹配（打印机被改名也不影响），匹配不到再退回按名字匹配
+function Get-UsageOf {
+    param($Usage, [AllowEmptyString()][string]$Name, [AllowEmptyString()][string]$Port)
+    $none = [ordered]@{ Times = 0; Last = '' }
+    if ($null -eq $Usage) { return $none }
+    if (-not [string]::IsNullOrEmpty($Port)) {
+        $k = $Port.ToLower()
+        if ($Usage.ByPort.ContainsKey($k)) { return $Usage.ByPort[$k] }
+    }
+    if (-not [string]::IsNullOrEmpty($Name)) {
+        $k2 = $Name.ToLower()
+        if ($Usage.ByName.ContainsKey($k2)) { return $Usage.ByName[$k2] }
+    }
+    return $none
+}
+
+function Get-UsageText {
+    param($U)
+    if ($null -eq $U) { return '无使用记录' }
+    if ($U.Times -le 0) { return '无使用记录' }
+    return ('最近 ' + [string]$U.Last + '，共 ' + $U.Times + ' 次')
+}
+
+# 在两条重复条目里选一条建议保留。
+# 判据优先级：① 只有一条有成功打印记录 -> 留它；② 两条都有 -> 留最近用过的那条（同时提示需人工确认）；
+#             ③ 两条都没记录 -> 退化为按驱动判断，留装了厂商驱动的那条（通用 IPP 类驱动功能会缺）。
+# 返回 @{ Keep='A'|'B'|''; KeepName; DropName; Reason; BothUsed }
+function Get-DupVerdict {
+    param(
+        [AllowEmptyString()][string]$NameA = '',
+        [int]$UseA = 0,
+        [AllowEmptyString()][string]$LastA = '',
+        [bool]$IppA = $false,
+        [AllowEmptyString()][string]$NameB = '',
+        [int]$UseB = 0,
+        [AllowEmptyString()][string]$LastB = '',
+        [bool]$IppB = $false
+    )
+    $keep = ''
+    $reason = ''
+    $both = $false
+
+    if ($UseA -gt 0 -and $UseB -eq 0) {
+        $keep = 'A'
+        $reason = '有成功打印记录，而另一条从未被使用过'
+    }
+    elseif ($UseB -gt 0 -and $UseA -eq 0) {
+        $keep = 'B'
+        $reason = '有成功打印记录，而另一条从未被使用过'
+    }
+    elseif ($UseA -gt 0 -and $UseB -gt 0) {
+        $both = $true
+        if ($LastA -gt $LastB) { $keep = 'A' } else { $keep = 'B' }
+        $reason = '两条都在用，只能按“最近用过”排序'
+    }
+    elseif ($IppA -ne $IppB) {
+        if (-not $IppA) { $keep = 'A' } else { $keep = 'B' }
+        $reason = '两条都没有打印记录，改按驱动判断：保留装了厂商驱动的条目'
+    }
+    else {
+        $keep = ''
+        $reason = '两条都没有打印记录、驱动类型也相同，无法判断该留哪条'
+    }
+
+    $keepName = ''
+    $dropName = ''
+    if ($keep -eq 'A') { $keepName = $NameA; $dropName = $NameB }
+    if ($keep -eq 'B') { $keepName = $NameB; $dropName = $NameA }
+
+    return [ordered]@{
+        Keep     = $keep
+        KeepName = $keepName
+        DropName = $dropName
+        Reason   = $reason
+        BothUsed = $both
+    }
+}
+
+# 把「该保留哪条」的使用证据与建议拼成多行文本。每行自带 7 个空格缩进，
+# 追加到告警文字后面时，正好与 [标签] 之后的正文左对齐。
+function Get-DupAdvice {
+    param($A, $B, $Usage)
+    $ind = '       '
+    $ua = Get-UsageOf -Usage $Usage -Name ([string]$A.Name) -Port ([string]$A.Port)
+    $ub = Get-UsageOf -Usage $Usage -Name ([string]$B.Name) -Port ([string]$B.Port)
+    $lines = New-Object System.Collections.ArrayList
+
+    if ($null -ne $Usage -and $Usage.Error) {
+        [void]$lines.Add($ind + '使用记录: 打印操作日志不可读，无法据此判断该保留哪条')
+        [void]$lines.Add($ind + '建议: 优先保留装了厂商驱动的那条（通用 IPP 类驱动功能会缺失）')
+        return ("`n" + ($lines -join "`n"))
+    }
+    if ($null -ne $Usage -and $Usage.Disabled) {
+        [void]$lines.Add($ind + '使用记录: 打印操作日志未启用，无法判断哪条在用')
+        [void]$lines.Add($ind + '建议: 先开启打印操作日志（本工具加 -Repair 可开），用一段时间后再回来判断')
+        return ("`n" + ($lines -join "`n"))
+    }
+
+    $w = 30
+    foreach ($n in @([string]$A.Name, [string]$B.Name)) {
+        $nw = Get-DispWidth -Text $n
+        if ($nw -gt $w) { $w = $nw }
+    }
+    if ($w -gt 36) { $w = 36 }
+
+    [void]$lines.Add($ind + '使用记录（打印操作日志事件 307）:')
+    [void]$lines.Add($ind + '  ' + (Pad-R (Get-Trunc -Text ([string]$A.Name) -Width $w) $w) + ' ' + (Get-UsageText -U $ua))
+    [void]$lines.Add($ind + '  ' + (Pad-R (Get-Trunc -Text ([string]$B.Name) -Width $w) $w) + ' ' + (Get-UsageText -U $ub))
+    if ($null -ne $Usage -and $Usage.Total -le 0) {
+        [void]$lines.Add($ind + '  （日志里没有任何历史打印记录）')
+    }
+
+    $v = Get-DupVerdict -NameA ([string]$A.Name) -UseA ([int]$ua.Times) -LastA ([string]$ua.Last) -IppA ([bool]$A.IsIpp) -NameB ([string]$B.Name) -UseB ([int]$ub.Times) -LastB ([string]$ub.Last) -IppB ([bool]$B.IsIpp)
+
+    if ($v.Keep -eq '') {
+        [void]$lines.Add($ind + '建议: ' + $v.Reason)
+    }
+    else {
+        [void]$lines.Add($ind + '建议保留: 「' + $v.KeepName + '」')
+        [void]$lines.Add($ind + '建议删除: 「' + $v.DropName + '」')
+        [void]$lines.Add($ind + '依据: ' + $v.Reason)
+        if ($v.BothUsed) {
+            [void]$lines.Add($ind + '注意: 两条都有打印记录，删除前请确认另一条确实不再需要')
+        }
+        [void]$lines.Add($ind + '操作: 设置 → 蓝牙和其他设备 → 打印机和扫描仪 → 选中「' + $v.DropName + '」→ 删除设备')
+    }
+    return ("`n" + ($lines -join "`n"))
+}
+
 function Get-Trunc {
     param([AllowEmptyString()][string]$Text, [int]$Width)
     if ([string]::IsNullOrEmpty($Text)) { return '' }
@@ -483,6 +702,7 @@ else {
     }
 
     # -- 同一台物理打印机是否被注册成了多个条目 --
+    $dupPairs = New-Object System.Collections.ArrayList
     $dupNames = New-Object System.Collections.ArrayList
     for ($i = 0; $i -lt $prnList.Count; $i++) {
         for ($j = $i + 1; $j -lt $prnList.Count; $j++) {
@@ -490,16 +710,39 @@ else {
             $b = $prnList[$j]
             $shared = @($a.Tok | Where-Object { $b.Tok -contains $_ })
             if ($shared.Count -eq 0) { continue }
-            $usbCombo = (($a.Conn -match '^USB') -xor ($b.Conn -match '^USB'))
-            $msg = '同一台打印机注册了多个条目: ' + $a.Name + ' [' + $a.Conn + '] 与 ' + $b.Name + ' [' + $b.Conn + ']  (共有标识: ' + ($shared -join '/') + ')'
-            if ($usbCombo) {
-                Add-Flag 'CRITICAL' ($msg + ' —— 同一台机器同时保留 USB 直连与网络两条通道，是最容易触发 spoolsv 崩溃的组合')
-            }
-            else {
-                Add-Flag 'WARN' $msg
-            }
+            [void]$dupPairs.Add([ordered]@{ A = $a; B = $b; Shared = $shared })
             if (-not $dupNames.Contains([string]$a.Name)) { [void]$dupNames.Add([string]$a.Name) }
             if (-not $dupNames.Contains([string]$b.Name)) { [void]$dupNames.Add([string]$b.Name) }
+        }
+    }
+
+    # 只有确实存在重复条目时才去读打印操作日志（没有重复就不花这个时间）
+    $usage = $null
+    if ($dupPairs.Count -gt 0) {
+        $kPorts = @()
+        $kNames = @()
+        foreach ($o in $prnList) {
+            $kPorts += [string]$o.Port
+            $kNames += [string]$o.Name
+        }
+        $usage = Get-PrinterUsage -MaxEvents 500 -KnownPorts $kPorts -KnownNames $kNames
+    }
+
+    foreach ($pair in $dupPairs) {
+        $a = $pair.A
+        $b = $pair.B
+        $shared = $pair.Shared
+        $usbCombo = (($a.Conn -match '^USB') -xor ($b.Conn -match '^USB'))
+        $msg = '同一台打印机注册了多个条目: ' + $a.Name + ' [' + $a.Conn + '] 与 ' + $b.Name + ' [' + $b.Conn + ']  (共有标识: ' + ($shared -join '/') + ')'
+        if ($usbCombo) {
+            $msg = $msg + ' —— 同一台机器同时保留 USB 直连与网络两条通道，是最容易触发 spoolsv 崩溃的组合'
+        }
+        $msg = $msg + (Get-DupAdvice -A $a -B $b -Usage $usage)
+        if ($usbCombo) {
+            Add-Flag 'CRITICAL' $msg
+        }
+        else {
+            Add-Flag 'WARN' $msg
         }
     }
 
@@ -520,8 +763,24 @@ else {
 Add-Line '-- USB 监视器端口 --'
 try {
     $usbPorts = @(Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors\USB Monitor\Ports' -ErrorAction Stop)
-    foreach ($u in $usbPorts) { Add-Line ('  ' + $u.PSChildName) }
     if ($usbPorts.Count -eq 0) { Add-Line '  （无）' }
+    foreach ($u in $usbPorts) {
+        $pn = [string]$u.PSChildName
+        $owner = ''
+        if ($null -ne $prnList) {
+            foreach ($o in $prnList) {
+                if ([string]$o.Port -eq $pn) { $owner = [string]$o.Name; break }
+            }
+        }
+        if ([string]::IsNullOrEmpty($owner)) {
+            # 这类“孤儿端口”本身无害：端口定义还留在注册表里，但没有任何打印机指向它。
+            # 用户看到 USB001 很容易误以为 USB 通道仍在工作（甚至去拔线缆），所以这里必须写明。
+            Add-Line ('  ' + $pn + '  （无打印机使用；只是残留的端口定义，拔插线缆不会改变它，也不影响打印）')
+        }
+        else {
+            Add-Line ('  ' + $pn + '  <- 正在被「' + $owner + '」使用')
+        }
+    }
 }
 catch {
     Add-Line '  （无法读取）'
@@ -631,6 +890,9 @@ Add-Line '建议动作:'
 Add-Line '  1. 若存在“端口/驱动错配”，删除该打印机并改用官方驱动重建（不要让它落在 IPP 类驱动上）'
 Add-Line '  2. 若存在“同一台打印机注册了多个条目”，打开 设置 → 蓝牙和其他设备 → 打印机和扫描仪，'
 Add-Line '     把多余的那条删掉，同一台机器只留一条通道（USB 直连 或 网络，二选一）'
+Add-Line '     具体该保留、该删除哪一条，见上方该条告警里的“建议保留 / 建议删除”'
+Add-Line '     注意: 这些条目是系统里的登记项，不是线缆状态。拔掉 USB 线缆不会让告警消失，'
+Add-Line '           必须到上面那个设置页面把多余条目删掉；若两条都是网络通道，则与 USB 完全无关'
 Add-Line '  3. 若存在“组件签名异常”，以管理员身份加 -Repair 运行本工具，会从组件存储还原并隔离外来文件'
 Add-Line '  4. 若队列堆积，加 -ClearQueue 运行（会先备份到带时间戳的目录，不做删除）'
 Add-Line '  5. 开启打印操作日志以便日后审计'
