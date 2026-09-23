@@ -10,7 +10,7 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-lightgrey.svg)](#)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](#)
 
-[**中文文档**](#中文文档) · [**English**](#english) · [**🌐 宣传页 Landing Page**](https://dc1024.github.io/winprintdiag/)
+[**中文文档**](#中文文档) · [**English**](#english) · [**🌐 宣传页 Landing Page**](https://dc1024.github.io/winprintdiag/) · [**EN page**](https://dc1024.github.io/winprintdiag/?lang=en)
 
 </div>
 

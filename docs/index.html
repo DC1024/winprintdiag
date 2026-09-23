@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WinPrintDiag · Windows 打印子系统便携体检工具</title>
 <meta name="description" content="Print Spooler 反复停止？打印机端口/驱动错配？WinPrintDiag 免安装、默认只读，一次性收齐崩溃历史、组件签名、打印机配对与队列线索。A portable no-install diagnostic tool for the Windows printing subsystem.">
+<link rel="alternate" hreflang="zh-CN" href="https://dc1024.github.io/winprintdiag/">
+<link rel="alternate" hreflang="en" href="https://dc1024.github.io/winprintdiag/?lang=en">
+<link rel="alternate" hreflang="x-default" href="https://dc1024.github.io/winprintdiag/">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232F6BFF'/%3E%3Ctext x='16' y='23' font-size='17' text-anchor='middle' fill='white' font-family='monospace'%3EW%3C/text%3E%3C/svg%3E">
 <style>
   :root{
@@ -523,12 +526,12 @@ Pantum-13CEDD (M6200NW series)          WSD-c0c4001a-e93a-4cd5-8f4f~ 网络 WSD 
 (function () {
   var body = document.body;
 
-  function setLang(en) {
+  function setLang(en, persist) {
     body.classList.toggle('en', en);
     document.getElementById('lzh').classList.toggle('on', !en);
     document.getElementById('len').classList.toggle('on', en);
     document.documentElement.lang = en ? 'en' : 'zh-CN';
-    try { localStorage.setItem('wpd-lang', en ? 'en' : 'zh'); } catch (e) { }
+    if (persist !== false) { try { localStorage.setItem('wpd-lang', en ? 'en' : 'zh'); } catch (e) { } }
   }
 
   document.getElementById('lzh').addEventListener('click', function () { setLang(false); });
@@ -536,8 +539,16 @@ Pantum-13CEDD (M6200NW series)          WSD-c0c4001a-e93a-4cd5-8f4f~ 网络 WSD 
 
   var saved = null;
   try { saved = localStorage.getItem('wpd-lang'); } catch (e) { }
-  if (saved === 'en') { setLang(true); }
-  else if (!saved && (navigator.language || '').toLowerCase().indexOf('zh') !== 0) { setLang(true); }
+
+  // ?lang=en / ?lang=zh 优先级最高，用来分享指定语言的链接（不写回本地偏好）
+  var qs = (location.search.match(/[?&]lang=(en|zh)(?:&|$)/i) || [])[1];
+  if (qs) {
+    setLang(qs.toLowerCase() === 'en', false);
+  } else if (saved === 'en') {
+    setLang(true);
+  } else if (!saved && (navigator.language || '').toLowerCase().indexOf('zh') !== 0) {
+    setLang(true);
+  }
 
   // 代码块复制
   Array.prototype.forEach.call(document.querySelectorAll('.code'), function (box) {
