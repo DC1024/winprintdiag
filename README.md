@@ -1,3 +1,9 @@
+> [!IMPORTANT]
+> **本工具已并入 [PrinterStatusGuard](https://github.com/DC1024/PrinterStatusGuard)（v1.1.0 起）**，成为其主界面的「深度体检」标签页。
+> 本仓库已归档、不再维护；全部功能（含修复组件、清理队列）请在 PrinterStatusGuard 的「深度体检」页签中使用。
+>
+> **This tool has been merged into [PrinterStatusGuard](https://github.com/DC1024/PrinterStatusGuard) (since v1.1.0) as its built-in "Deep Checkup" tab. This repository is archived and no longer maintained — all functionality lives on in PrinterStatusGuard.**
+
 <div align="center">
 
 # WinPrintDiag
